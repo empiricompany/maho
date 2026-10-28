@@ -37,7 +37,7 @@ class Mage_Adminhtml_Block_System_Email_Template_Preview extends Mage_Adminhtml_
         }
 
         \Maho\Profiler::start('email_template_proccessing');
-        $vars = [];
+        $vars = $this->getPreviewVariables((int) $defaultStoreId);
 
         $templateProcessed = $template->getProcessedTemplate($vars);
 
@@ -56,5 +56,24 @@ class Mage_Adminhtml_Block_System_Email_Template_Preview extends Mage_Adminhtml_
         $appEmulation->stopEnvironmentEmulation($initialEnvironmentInfo);
 
         return $templateProcessed;
+    }
+
+    /**
+     * The variables to preview the template with.
+     *
+     * Instantiated directly: the alias would be `adminhtml/email_template_preview_data`, and
+     * `uc_words()` turns that into `Preview_Data`, which is not where the class lives.
+     *
+     * @param int $storeId
+     * @return array<string, mixed>
+     */
+    protected function getPreviewVariables(int $storeId)
+    {
+        try {
+            return (new Mage_Adminhtml_Model_Email_Template_PreviewData())->getVariables($storeId);
+        } catch (Throwable $e) {
+            Mage::logException($e);
+            return [];
+        }
     }
 }
