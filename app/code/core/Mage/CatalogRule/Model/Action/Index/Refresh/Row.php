@@ -47,27 +47,21 @@ class Mage_CatalogRule_Model_Action_Index_Refresh_Row extends Mage_CatalogRule_M
      * @return Maho\Db\Select
      */
     #[\Override]
-    protected function _prepareTemporarySelect(Mage_Core_Model_Website $website)
+    protected function _prepareRuleProductSelect(Mage_Core_Model_Website $website)
     {
-        $select = parent::_prepareTemporarySelect($website);
+        $select = parent::_prepareRuleProductSelect($website);
         return $select->where('rp.product_id IN (?)', $this->_productId);
     }
 
     /**
-     * Remove old index data
+     * A row refresh only covers the product it was asked for
+     *
+     * @return int[]
      */
     #[\Override]
-    protected function _removeOldIndexData(Mage_Core_Model_Website $website)
+    protected function _getIndexedProductIds(int $websiteId): array
     {
-        $this->_connection->query(
-            $this->_connection->deleteFromSelect(
-                $this->_connection->select()
-                    ->from($this->_resource->getTable('catalogrule/rule_product_price'))
-                    ->where('product_id IN (?)', $this->_productId)
-                    ->where('website_id = ?', $website->getId()),
-                $this->_resource->getTable('catalogrule/rule_product_price'),
-            ),
-        );
+        return [(int) $this->_productId];
     }
 
     /**

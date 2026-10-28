@@ -13,6 +13,11 @@ class Mage_CatalogRule_Model_Action_Index_Refresh
     protected const INDEX_INSERT_BATCH = 1000;
 
     /**
+     * Products per pass: it keeps the rows compared in memory bounded on large catalogues
+     */
+    protected const INDEX_PRODUCT_CHUNK = 1000;
+
+    /**
      * Connection instance
      *
      * @var Maho\Db\Adapter\AdapterInterface
@@ -100,143 +105,11 @@ class Mage_CatalogRule_Model_Action_Index_Refresh
     }
 
     /**
-     * Return temporary table name
-     *
-     * @return string
-     */
-    protected function _getTemporaryTable()
-    {
-        return $this->_resource->getTable('catalogrule/rule_product_price_tmp');
-    }
-
-    /**
-     * Create temporary table
-     */
-    protected function _createTemporaryTable()
-    {
-        $this->_connection->dropTemporaryTable($this->_getTemporaryTable());
-        $table = $this->_connection->newTable($this->_getTemporaryTable())
-            ->addColumn(
-                'grouped_id',
-                Maho\Db\Ddl\Table::TYPE_VARCHAR,
-                80,
-                [],
-                'Grouped ID',
-            )
-            ->addColumn(
-                'product_id',
-                Maho\Db\Ddl\Table::TYPE_INTEGER,
-                null,
-                [
-                    'unsigned' => true,
-                ],
-                'Product ID',
-            )
-            ->addColumn(
-                'customer_group_id',
-                Maho\Db\Ddl\Table::TYPE_SMALLINT,
-                5,
-                [
-                    'unsigned' => true,
-                ],
-                'Customer Group ID',
-            )
-            ->addColumn(
-                'from_date',
-                Maho\Db\Ddl\Table::TYPE_DATE,
-                null,
-                [],
-                'From Date',
-            )
-            ->addColumn(
-                'to_date',
-                Maho\Db\Ddl\Table::TYPE_DATE,
-                null,
-                [],
-                'To Date',
-            )
-            ->addColumn(
-                'action_amount',
-                Maho\Db\Ddl\Table::TYPE_DECIMAL,
-                '12,4',
-                [],
-                'Action Amount',
-            )
-            ->addColumn(
-                'action_operator',
-                Maho\Db\Ddl\Table::TYPE_VARCHAR,
-                10,
-                [],
-                'Action Operator',
-            )
-            ->addColumn(
-                'action_stop',
-                Maho\Db\Ddl\Table::TYPE_SMALLINT,
-                6,
-                [],
-                'Action Stop',
-            )
-            ->addColumn(
-                'sort_order',
-                Maho\Db\Ddl\Table::TYPE_INTEGER,
-                10,
-                [
-                    'unsigned' => true,
-                ],
-                'Sort Order',
-            )
-            ->addColumn(
-                'price',
-                Maho\Db\Ddl\Table::TYPE_DECIMAL,
-                '12,4',
-                [],
-                'Product Price',
-            )
-            ->addColumn(
-                'rule_product_id',
-                Maho\Db\Ddl\Table::TYPE_INTEGER,
-                null,
-                [
-                    'unsigned' => true,
-                ],
-                'Rule Product ID',
-            )
-            ->addColumn(
-                'from_time',
-                Maho\Db\Ddl\Table::TYPE_INTEGER,
-                null,
-                [
-                    'unsigned' => true,
-                    'nullable' => true,
-                    'default'  => 0,
-                ],
-                'From Time',
-            )
-            ->addColumn(
-                'to_time',
-                Maho\Db\Ddl\Table::TYPE_INTEGER,
-                null,
-                [
-                    'unsigned' => true,
-                    'nullable' => true,
-                    'default'  => 0,
-                ],
-                'To Time',
-            )
-            ->addIndex(
-                $this->_connection->getIndexName($this->_getTemporaryTable(), 'grouped_id'),
-                ['grouped_id'],
-            )
-            ->setComment('CatalogRule Price Temporary Table');
-        $this->_connection->createTemporaryTable($table);
-    }
-
-    /**
      * Prepare temporary data
      *
      * @return Maho\Db\Select
      */
-    protected function _prepareTemporarySelect(Mage_Core_Model_Website $website)
+    protected function _prepareRuleProductSelect(Mage_Core_Model_Website $website)
     {
         $eavConfig = $this->_factory->getSingleton('eav/config');
         if (!$eavConfig instanceof Mage_Eav_Model_Config) {
@@ -316,10 +189,6 @@ class Mage_CatalogRule_Model_Action_Index_Refresh
 
         $select->columns(
             [
-                'grouped_id' => $this->_connection->getConcatSql(
-                    ['rp.product_id', 'rp.customer_group_id'],
-                    '-',
-                ),
                 'product_id'        => 'rp.product_id',
                 'customer_group_id' => 'rp.customer_group_id',
                 'from_date'         => 'r.from_date',
@@ -356,56 +225,42 @@ class Mage_CatalogRule_Model_Action_Index_Refresh
      * one produced, until a rule with action_stop breaks the chain. That is a running calculation
      * over ordered rows, which used to be done with MySQL user variables (SET @price := ...) and
      * so only ever worked on MySQL. It is done here instead, once per row, in the same order.
+     *
+     * Only the rows whose price changed are written. Deleting and reinserting a whole index that
+     * did not change costs more than building it from scratch, because every row is rewritten
+     * together with its index entries: a catalogue nobody touched still paid for all of them.
      */
     protected function _fillIndexData(Mage_Core_Model_Website $website, int $time): void
     {
         $table = $this->_resource->getTable('catalogrule/rule_product_price');
-        $websiteId = (int) $website->getId();
         $dates = $this->_getRuleDates($time);
+        $productIds = $this->_getIndexedProductIds((int) $website->getId());
+        if ($productIds === []) {
+            return;
+        }
 
-        $statement = $this->_connection->query(
-            $this->_connection->select()
-                ->from(['cppt' => $this->_getTemporaryTable()])
-                ->order(['cppt.grouped_id', 'cppt.sort_order', 'cppt.rule_product_id']),
-        );
-
-        $groupedId = null;
-        $price = 0.0;
-        $actionStop = 0;
-        $group = [];
-        $pending = [];
+        $chunks = array_chunk($productIds, self::INDEX_PRODUCT_CHUNK);
 
         $this->_connection->beginTransaction();
         try {
-            while ($row = $statement->fetch()) {
-                if ((string) $row['grouped_id'] !== $groupedId) {
-                    $pending = array_merge($pending, array_values($group));
-                    $group = [];
-                    $groupedId = (string) $row['grouped_id'];
-                    $price = $this->_applyRuleAction((float) $row['price'], $row);
-                    $actionStop = (int) $row['action_stop'];
-                } else {
-                    if ($actionStop === 0) {
-                        $price = $this->_applyRuleAction($price, $row);
-                    }
-                    $actionStop += (int) $row['action_stop'];
+            $probe = $this->_fillIndexChunk($table, $website, $chunks[0], $dates, dryRun: true);
+            // A row refresh covers one product, where "most of it changed" is the normal case
+            // and says nothing about the rest of the index.
+            if ($this->_getProduct() === null && $probe['changed'] * 2 > $probe['compared']) {
+                // Most of the first group changed: the index is being rewritten, and one delete
+                // followed by one pass over the website beats a delete per row.
+                $where = ['website_id = ?' => (int) $website->getId()];
+                if ($productIds !== []) {
+                    $where['product_id IN (?)'] = $productIds;
                 }
-
-                foreach ($dates as $date => $timestamp) {
-                    if ($this->_isRuleActiveAt($row, $timestamp)) {
-                        $this->_collectRulePrice($group, $date, $row, $price, $websiteId);
-                    }
+                $this->_connection->delete($table, $where);
+                foreach ($chunks as $chunk) {
+                    $this->_fillIndexChunk($table, $website, $chunk, $dates, replaceAll: true);
                 }
-
-                if (count($pending) >= self::INDEX_INSERT_BATCH) {
-                    $this->_connection->insertMultiple($table, $pending);
-                    $pending = [];
+            } else {
+                foreach ($chunks as $chunk) {
+                    $this->_fillIndexChunk($table, $website, $chunk, $dates);
                 }
-            }
-
-            $pending = array_merge($pending, array_values($group));
-            if ($pending) {
-                $this->_connection->insertMultiple($table, $pending);
             }
 
             $this->_connection->commit();
@@ -413,6 +268,220 @@ class Mage_CatalogRule_Model_Action_Index_Refresh
             $this->_connection->rollBack();
             throw $e;
         }
+    }
+
+    /**
+     * Write the index rows of one group of products
+     *
+     * The rows are read straight from the join and consumed in order, so the temporary table that
+     * used to hold them — one INSERT ... SELECT over five joins plus a second read of the same
+     * rows — is gone.
+     *
+     * With $replaceAll the rows are known to be gone from the table already, so nothing is
+     * compared and nothing is deleted. A dry run only counts what would change.
+     *
+     * @param int[] $productIds
+     * @param array<string, int> $dates
+     * @return array{changed: int, compared: int}
+     */
+    protected function _fillIndexChunk(
+        string $table,
+        Mage_Core_Model_Website $website,
+        array $productIds,
+        array $dates,
+        bool $replaceAll = false,
+        bool $dryRun = false,
+    ): array {
+        $websiteId = (int) $website->getId();
+        $stored = $replaceAll ? [] : $this->_loadStoredPrices($table, $websiteId, $productIds);
+
+        $statement = $this->_connection->query(
+            $this->_prepareRuleProductSelect($website)
+                ->where('rp.product_id IN (?)', $productIds)
+                ->order(['rp.product_id', 'rp.customer_group_id', 'rp.sort_order', 'rp.rule_product_id']),
+        );
+
+        $groupKey = null;
+        $price = 0.0;
+        $actionStop = 0;
+        $group = [];
+        $pending = [];
+        $written = [];
+        $replaced = [];
+
+        while ($row = $statement->fetch()) {
+            $rowGroupKey = $row['product_id'] . ':' . $row['customer_group_id'];
+            if ($rowGroupKey !== $groupKey) {
+                $this->_stageGroup($pending, $group, $stored, $written, $replaced);
+                $group = [];
+                $groupKey = $rowGroupKey;
+                $price = $this->_applyRuleAction((float) $row['price'], $row);
+                $actionStop = (int) $row['action_stop'];
+            } else {
+                if ($actionStop === 0) {
+                    $price = $this->_applyRuleAction($price, $row);
+                }
+                $actionStop += (int) $row['action_stop'];
+            }
+
+            foreach ($dates as $date => $timestamp) {
+                if ($this->_isRuleActiveAt($row, $timestamp)) {
+                    $this->_collectRulePrice($group, $date, $row, $price, $websiteId);
+                }
+            }
+        }
+
+        $this->_stageGroup($pending, $group, $stored, $written, $replaced);
+
+        $result = ['changed' => count($replaced), 'compared' => count($stored)];
+        if ($dryRun) {
+            return $result;
+        }
+
+        // A changed row cannot be inserted over itself: the unique key would reject it
+        foreach (array_diff_key($stored, $written) as $key => $value) {
+            $replaced[$key] = true;
+        }
+
+        if (!$replaceAll && $replaced) {
+            $this->_removePrices($table, $websiteId, array_keys($replaced));
+        }
+
+        foreach (array_chunk($pending, self::INDEX_INSERT_BATCH) as $batch) {
+            $this->_insertRulePrices($table, $batch);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Products the index has to cover for a website: those with rule data, plus those that only
+     * have rows left in the price table from a rule that no longer applies to them.
+     *
+     * @return int[]
+     */
+    protected function _getIndexedProductIds(int $websiteId): array
+    {
+        $ids = $this->_connection->fetchCol(
+            $this->_connection->select()
+                ->distinct()
+                ->from(['rp' => $this->_resource->getTable('catalogrule/rule_product')], ['product_id'])
+                ->where('rp.website_id = ?', $websiteId),
+        );
+
+        $ids = array_merge($ids, $this->_connection->fetchCol(
+            $this->_connection->select()
+                ->distinct()
+                ->from($this->_resource->getTable('catalogrule/rule_product_price'), ['product_id'])
+                ->where('website_id = ?', $websiteId),
+        ));
+
+        $ids = array_values(array_unique(array_map('intval', $ids)));
+        sort($ids);
+
+        return $ids;
+    }
+
+    /**
+     * @param int[] $productIds
+     * @return array<string, array{float, ?string, ?string}> keyed by product:group:date
+     */
+    protected function _loadStoredPrices(string $table, int $websiteId, array $productIds): array
+    {
+        $stored = [];
+        $rows = $this->_connection->fetchAll(
+            $this->_connection->select()
+                ->from($table, ['product_id', 'customer_group_id', 'rule_date', 'rule_price',
+                    'latest_start_date', 'earliest_end_date'])
+                ->where('website_id = ?', $websiteId)
+                ->where('product_id IN (?)', $productIds),
+        );
+
+        foreach ($rows as $row) {
+            $stored[$this->_priceKey($row)] = [
+                (float) $row['rule_price'],
+                $row['latest_start_date'],
+                $row['earliest_end_date'],
+            ];
+        }
+
+        return $stored;
+    }
+
+    /**
+     * Queue the rows of a finished product/customer group pair, leaving out the ones already stored
+     *
+     * @param array $pending
+     * @param array<string, array> $group
+     * @param array<string, array> $stored
+     * @param array<string, true> $written
+     * @param array<string, true> $replaced
+     */
+    protected function _stageGroup(array &$pending, array $group, array $stored, array &$written, array &$replaced): void
+    {
+        foreach ($group as $row) {
+            $key = $this->_priceKey($row);
+            $written[$key] = true;
+
+            if (isset($stored[$key])) {
+                if ($this->_isStoredPrice($stored[$key], $row)) {
+                    continue;
+                }
+                $replaced[$key] = true;
+            }
+
+            $pending[] = $row;
+        }
+    }
+
+    /**
+     * Whether the stored row already holds what the rules produce now
+     */
+    protected function _isStoredPrice(array $stored, array $row): bool
+    {
+        return sprintf('%.4F', $stored[0]) === sprintf('%.4F', $row['rule_price'])
+            && $stored[1] === ($row['latest_start_date'] ?: null)
+            && $stored[2] === ($row['earliest_end_date'] ?: null);
+    }
+
+    /**
+     * Delete the rows that are gone or whose value is being replaced
+     *
+     * @param string[] $keys
+     */
+    protected function _removePrices(string $table, int $websiteId, array $keys): void
+    {
+        $conditions = [];
+        foreach ($keys as $key) {
+            [$productId, $customerGroupId, $ruleDate] = explode(':', $key);
+            $conditions[] = sprintf(
+                "(product_id = %d AND customer_group_id = %d AND rule_date = '%s')",
+                $productId,
+                $customerGroupId,
+                $ruleDate,
+            );
+
+            if (count($conditions) >= self::INDEX_INSERT_BATCH) {
+                $this->_connection->query(
+                    "DELETE FROM $table WHERE website_id = $websiteId AND (" . implode(' OR ', $conditions) . ')',
+                );
+                $conditions = [];
+            }
+        }
+
+        if ($conditions) {
+            $this->_connection->query(
+                "DELETE FROM $table WHERE website_id = $websiteId AND (" . implode(' OR ', $conditions) . ')',
+            );
+        }
+    }
+
+    /**
+     * @param array{product_id: int|string, customer_group_id: int|string, rule_date: string} $row
+     */
+    protected function _priceKey(array $row): string
+    {
+        return $row['product_id'] . ':' . $row['customer_group_id'] . ':' . $row['rule_date'];
     }
 
     /**
@@ -497,6 +566,39 @@ class Mage_CatalogRule_Model_Action_Index_Refresh
     }
 
     /**
+     * Write a batch of computed prices.
+     *
+     * The rows are built by _collectRulePrice from integers, floats and dates the
+     * code generated itself, so the statement is assembled once per batch instead
+     * of being prepared and bound value by value: on a catalogue of 10k products
+     * the binding alone was a third of the refresh time.
+     *
+     * @param array<int, array<string, mixed>> $rows
+     */
+    protected function _insertRulePrices(string $table, array $rows): void
+    {
+        $values = [];
+        foreach ($rows as $row) {
+            $values[] = sprintf(
+                "('%s',%d,%d,%.4F,%d,%s,%s)",
+                $row['rule_date'],
+                (int) $row['customer_group_id'],
+                (int) $row['product_id'],
+                (float) $row['rule_price'],
+                (int) $row['website_id'],
+                $row['latest_start_date'] === null ? 'NULL' : "'" . $row['latest_start_date'] . "'",
+                $row['earliest_end_date'] === null ? 'NULL' : "'" . $row['earliest_end_date'] . "'",
+            );
+        }
+
+        $this->_connection->query(
+            'INSERT INTO ' . $table
+            . ' (rule_date, customer_group_id, product_id, rule_price, website_id,'
+            . ' latest_start_date, earliest_end_date) VALUES ' . implode(',', $values),
+        );
+    }
+
+    /**
      * Reindex catalog prices by website for timestamp
      *
      * @param int $timestamp
@@ -509,14 +611,6 @@ class Mage_CatalogRule_Model_Action_Index_Refresh
             return;
         }
 
-        $this->_createTemporaryTable();
-        $this->_connection->query(
-            $this->_connection->insertFromSelect(
-                $this->_prepareTemporarySelect($website),
-                $this->_getTemporaryTable(),
-            ),
-        );
-        $this->_removeOldIndexData($website);
         $this->_fillIndexData($website, $timestamp);
     }
 
