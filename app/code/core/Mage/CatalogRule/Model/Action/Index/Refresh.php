@@ -376,7 +376,7 @@ class Mage_CatalogRule_Model_Action_Index_Refresh
                 ->where('website_id = ?', $websiteId),
         ));
 
-        $ids = array_values(array_unique(array_map('intval', $ids)));
+        $ids = array_values(array_unique(array_map(intval(...), $ids)));
         sort($ids);
 
         return $ids;
@@ -411,7 +411,6 @@ class Mage_CatalogRule_Model_Action_Index_Refresh
     /**
      * Queue the rows of a finished product/customer group pair, leaving out the ones already stored
      *
-     * @param array $pending
      * @param array<string, array> $group
      * @param array<string, array> $stored
      * @param array<string, true> $written

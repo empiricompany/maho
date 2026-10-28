@@ -8,6 +8,8 @@
  * @package Mage_CatalogRule
  */
 
+declare(strict_types=1);
+
 class Mage_CatalogRule_Model_Action_Index_Refresh_Row extends Mage_CatalogRule_Model_Action_Index_Refresh
 {
     /**
